@@ -1,17 +1,15 @@
-
 import os
 import sys
 import asyncio
+import uuid
 import streamlit as st
 from dotenv import load_dotenv
-
 
 if sys.platform == "win32" and sys.version_info < (3, 10):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from streamlit import config
 config.set_option("server.fileWatcherType", "none")
-
 
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import (
@@ -22,7 +20,6 @@ from langchain_huggingface import (
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
@@ -30,6 +27,7 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 
 from PyPDF2 import PdfReader
 from docx import Document
+
 
 load_dotenv()
 HUGGINGFACEHUB_API_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
@@ -39,14 +37,42 @@ if not HUGGINGFACEHUB_API_TOKEN:
     st.stop()
 
 st.set_page_config(page_title="LCEL RAG Chat", layout="wide")
-st.title("📚 Chat with Your Documents (LCEL RAG)")
+st.title(" Chat with Your Documents (LCEL RAG)")
+
+if "chats" not in st.session_state:
+    st.session_state["chats"] = {}
+
+if "active_chat_id" not in st.session_state:
+    chat_id = f"chat_{uuid.uuid4().hex[:8]}"
+    st.session_state["chats"][chat_id] = ChatMessageHistory()
+    st.session_state["active_chat_id"] = chat_id
+
+
+st.sidebar.markdown("## Chats")
+
+if st.sidebar.button(" New Chat"):
+    new_chat_id = f"chat_{uuid.uuid4().hex[:8]}"
+    st.session_state["chats"][new_chat_id] = ChatMessageHistory()
+    st.session_state["active_chat_id"] = new_chat_id
+    st.rerun()
+
+chat_ids = list(st.session_state["chats"].keys())
+selected_chat = st.sidebar.selectbox(
+    "Resume chat",
+    chat_ids,
+    index=chat_ids.index(st.session_state["active_chat_id"])
+)
+st.session_state["active_chat_id"] = selected_chat
+
+if st.sidebar.button(" Clear Current Chat"):
+    st.session_state["chats"][st.session_state["active_chat_id"]] = ChatMessageHistory()
+    st.rerun()
 
 uploaded_files = st.sidebar.file_uploader(
     "Upload PDF, DOCX, or TXT files",
     type=["pdf", "docx", "txt"],
     accept_multiple_files=True
 )
-
 
 def read_pdf(file):
     reader = PdfReader(file)
@@ -110,26 +136,27 @@ if uploaded_files:
         def format_docs(docs):
             return "\n\n".join(d.page_content for d in docs)
 
-        # ✅ Correct LCEL wiring
+        #  RAG chain with sources
         rag_chain = (
             {
-                "context": RunnableLambda(
-                    lambda x: format_docs(
-                        retriever.invoke(x["question"])
-                    )
-                ),
+                "docs": RunnableLambda(lambda x: retriever.invoke(x["question"])),
                 "question": RunnableLambda(lambda x: x["question"]),
                 "chat_history": RunnableLambda(lambda x: x.get("chat_history", [])),
             }
-            | prompt
-            | llm
-            | StrOutputParser()
+            | RunnableLambda(lambda x: {
+                "answer": llm.invoke(
+                    prompt.invoke({
+                        "context": format_docs(x["docs"]),
+                        "question": x["question"],
+                        "chat_history": x["chat_history"],
+                    })
+                ),
+                "sources": x["docs"],
+            })
         )
 
         def get_session_history(session_id: str):
-            if "history" not in st.session_state:
-                st.session_state["history"] = ChatMessageHistory()
-            return st.session_state["history"]
+            return st.session_state["chats"][st.session_state["active_chat_id"]]
 
         rag_chain_with_memory = RunnableWithMessageHistory(
             rag_chain,
@@ -147,12 +174,13 @@ else:
 
 if "rag_chain" in st.session_state:
 
-    # Display previous conversation
-    if "history" in st.session_state:
-        for msg in st.session_state["history"].messages:
-            role = "user" if msg.type == "human" else "assistant"
-            with st.chat_message(role):
-                st.markdown(msg.content)
+    current_history = st.session_state["chats"][st.session_state["active_chat_id"]]
+
+    # Render past messages
+    for msg in current_history.messages:
+        role = "user" if msg.type == "human" else "assistant"
+        with st.chat_message(role):
+            st.markdown(msg.content)
 
     user_input = st.chat_input("Ask a question about your documents")
 
@@ -161,10 +189,18 @@ if "rag_chain" in st.session_state:
             st.markdown(user_input)
 
         with st.spinner("Generating answer..."):
-            answer = st.session_state["rag_chain"].invoke(
+            result = st.session_state["rag_chain"].invoke(
                 {"question": user_input},
-                config={"configurable": {"session_id": "default"}}
+                config={"configurable": {"session_id": st.session_state["active_chat_id"]}}
             )
+
+        answer = result["answer"].content
+        sources = result["sources"]
 
         with st.chat_message("assistant"):
             st.markdown(answer)
+
+            with st.expander("Sources used"):
+                for i, doc in enumerate(sources):
+                    st.markdown(f"**Source {i+1}:**")
+                    st.markdown(doc.page_content[:400] + "…")
